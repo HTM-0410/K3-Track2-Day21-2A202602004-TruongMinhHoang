@@ -4,6 +4,8 @@
 
 Pipeline gồm bốn job `Unit Test → Train → Eval → Deploy`. Eval chỉ có một bước nghiệp vụ `Check eval gate`: đọc `metrics.json` do Train tạo và dừng pipeline nếu `accuracy < 0.70`. Run cuối trên GitHub Actions đã xanh cả bốn job: [run 32450659805](https://github.com/HTM-0410/K3-Track2-Day21-2A202602004-TruongMinhHoang/actions/runs/32450659805).
 
+Ngoài quality gate 0.70, pipeline còn giữ model mới ở vùng `models/candidates/<commit SHA>` và so sánh với accuracy của `models/latest`. Candidate thấp hơn production sẽ bị chặn; chỉ candidate đạt cả hai điều kiện mới được promote và restart service. MLflow CI hỗ trợ tracking từ xa qua ba GitHub Secrets `MLFLOW_TRACKING_URI`, `MLFLOW_TRACKING_USERNAME`, `MLFLOW_TRACKING_PASSWORD`, đồng thời vẫn fallback về SQLite khi chạy local hoặc khi secrets chưa được cấu hình.
+
 ### Task 1 – Theo dõi thí nghiệm và chọn mô hình
 
 | Cấu hình | Accuracy | Weighted F1 |

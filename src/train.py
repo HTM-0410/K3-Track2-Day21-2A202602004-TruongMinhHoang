@@ -128,7 +128,10 @@ def train(
     print(f"Model: {model_type} | Accuracy: {accuracy:.4f} | F1: {weighted_f1:.4f}")
 
     if tracking_enabled:
-        tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db")
+        # GitHub Actions can point these standard MLflow variables at DagsHub.
+        # An empty/missing secret deliberately falls back to local tracking so
+        # forks and local development remain reproducible.
+        tracking_uri = os.getenv("MLFLOW_TRACKING_URI") or "sqlite:///mlflow.db"
         experiment_name = os.getenv("MLFLOW_EXPERIMENT_NAME", "wine-quality-task-1")
         mlflow.set_tracking_uri(tracking_uri)
         mlflow.set_experiment(experiment_name)

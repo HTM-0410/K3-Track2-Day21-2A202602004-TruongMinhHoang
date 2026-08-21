@@ -41,6 +41,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       accuracy: ${{ steps.read_metrics.outputs.accuracy }}
+      deployed_accuracy: ${{ steps.production_metrics.outputs.accuracy }}
+      baseline_available: ${{ steps.production_metrics.outputs.available }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -58,7 +60,9 @@ jobs:
         run: dvc pull data/train_phase1.csv data/eval.csv
       - name: Train and evaluate model
         env:
-          MLFLOW_TRACKING_URI: sqlite:///mlflow-ci.db
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          MLFLOW_TRACKING_USERNAME: ${{ secrets.MLFLOW_TRACKING_USERNAME }}
+          MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_TRACKING_PASSWORD }}
           MLFLOW_EXPERIMENT_NAME: wine-quality-ci
         run: python src/train.py
       - name: Read metrics
@@ -66,19 +70,48 @@ jobs:
         run: |
           ACC=$(python -c "import json; print(json.load(open('outputs/metrics.json'))['accuracy'])")
           echo "accuracy=$ACC" >> "$GITHUB_OUTPUT"
-      - name: Upload model and evaluation to Cloud Storage
+      - name: Read deployed model metrics
+        id: production_metrics
         env:
           CLOUD_BUCKET: ${{ secrets.CLOUD_BUCKET }}
+        run: |
+          python - <<'EOF'
+          import json
+          import os
+          from google.api_core.exceptions import NotFound
+          from google.cloud import storage
+
+          blob = storage.Client().bucket(os.environ['CLOUD_BUCKET']).blob(
+              'models/latest/metrics.json'
+          )
+          try:
+              accuracy = float(json.loads(blob.download_as_text())['accuracy'])
+              available = 'true'
+              print(f'Deployed model accuracy: {accuracy:.4f}')
+          except NotFound:
+              accuracy = 0.0
+              available = 'false'
+              print('No deployed model found; treating this as the first deployment.')
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'accuracy={accuracy}\n')
+              output.write(f'available={available}\n')
+          EOF
+      - name: Upload candidate model and evaluation to Cloud Storage
+        env:
+          CLOUD_BUCKET: ${{ secrets.CLOUD_BUCKET }}
+          CANDIDATE_PREFIX: models/candidates/${{ github.sha }}
         run: |
           python - <<'EOF'
           import os
           from google.cloud import storage
 
           bucket = storage.Client().bucket(os.environ['CLOUD_BUCKET'])
+          prefix = os.environ['CANDIDATE_PREFIX']
           for source, destination in (
-              ('models/model.pkl', 'models/latest/model.pkl'),
-              ('outputs/metrics.json', 'models/latest/metrics.json'),
-              ('outputs/report.txt', 'models/latest/report.txt'),
+              ('models/model.pkl', f'{prefix}/model.pkl'),
+              ('outputs/metrics.json', f'{prefix}/metrics.json'),
+              ('outputs/report.txt', f'{prefix}/report.txt'),
           ):
               bucket.blob(destination).upload_from_filename(source)
               print(f'Uploaded gs://{bucket.name}/{destination}')
@@ -101,17 +134,30 @@ jobs:
       - name: Check eval gate
         env:
           ACCURACY: ${{ needs.train.outputs.accuracy }}
+          DEPLOYED_ACCURACY: ${{ needs.train.outputs.deployed_accuracy }}
+          BASELINE_AVAILABLE: ${{ needs.train.outputs.baseline_available }}
         run: |
           python - <<'EOF'
           import os
 
           threshold = 0.70
           accuracy = float(os.environ['ACCURACY'])
+          deployed_accuracy = float(os.environ['DEPLOYED_ACCURACY'])
+          baseline_available = os.environ['BASELINE_AVAILABLE'] == 'true'
           if accuracy < threshold:
               raise SystemExit(
                   f'FAILED: accuracy {accuracy:.4f} < {threshold:.2f}; deploy blocked.'
               )
-          print(f'PASSED: accuracy {accuracy:.4f} >= {threshold:.2f}.')
+          if baseline_available and accuracy < deployed_accuracy:
+              raise SystemExit(
+                  f'ROLLBACK GATE: candidate {accuracy:.4f} < deployed '
+                  f'{deployed_accuracy:.4f}; deploy blocked.'
+              )
+          baseline = f'{deployed_accuracy:.4f}' if baseline_available else 'none'
+          print(
+              f'PASSED: candidate={accuracy:.4f}, threshold={threshold:.2f}, '
+              f'deployed={baseline}; candidate is safe to promote.'
+          )
           EOF
 
   deploy:
@@ -120,6 +166,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - name: Set up Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+      - name: Promote approved candidate
+        env:
+          CLOUD_BUCKET: ${{ secrets.CLOUD_BUCKET }}
+          CANDIDATE_PREFIX: models/candidates/${{ github.sha }}
+        run: |
+          for filename in model.pkl metrics.json report.txt; do
+            gcloud storage cp \
+              "gs://${CLOUD_BUCKET}/${CANDIDATE_PREFIX}/${filename}" \
+              "gs://${CLOUD_BUCKET}/models/latest/${filename}"
+            echo "Promoted ${CANDIDATE_PREFIX}/${filename} -> models/latest/${filename}"
+          done
       - name: Copy serving code and service definition
         uses: appleboy/scp-action@v0.1.7
         with:
