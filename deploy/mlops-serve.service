@@ -1,0 +1,18 @@
+[Unit]
+Description=MLOps Wine Quality FastAPI service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=Admin
+Group=Admin
+WorkingDirectory=/home/Admin
+Environment=HOME=/home/Admin
+Environment=GCS_BUCKET=mlops-hoangtruongminh22-977661303
+ExecStart=/usr/bin/python3 -m uvicorn src.serve:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

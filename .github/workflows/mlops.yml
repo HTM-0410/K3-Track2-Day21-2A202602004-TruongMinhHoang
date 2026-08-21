@@ -6,152 +6,177 @@ on:
     paths:
       - 'data/**.dvc'
       - 'src/**.py'
+      - 'tests/**.py'
+      - 'deploy/**'
       - 'params.yaml'
+      - 'requirements.txt'
+      - '.github/workflows/mlops.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
   id-token: write
 
-jobs:
+env:
+  PYTHONUTF8: '1'
 
-  # ---------------------------------------------------------------------------
-  # JOB 1 - UNIT TEST
-  # Chay unit tests tren du lieu ao (khong can ket noi cloud storage).
-  # Neu co bat ky test nao that bai, pipeline dung lai o day va khong tien hanh
-  # huan luyen hay trien khai.
-  # ---------------------------------------------------------------------------
+jobs:
   test:
     name: Unit Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
-
+          python-version: '3.10'
+          cache: pip
       - name: Install dependencies
         run: pip install -r requirements.txt
-
       - name: Run unit tests
         run: pytest tests/ -v
 
-
-  # ---------------------------------------------------------------------------
-  # JOB 2 - TRAIN
-  # Xac thuc cloud storage bang Workload Identity Federation (keyless),
-  # pull du lieu bang DVC, huan luyen mo hinh, upload artifact.
-  # Chi chay khi Job 1 (Unit Test) hoan thanh thanh cong.
-  # ---------------------------------------------------------------------------
   train:
     name: Train
     needs: test
     runs-on: ubuntu-latest
     outputs:
       accuracy: ${{ steps.read_metrics.outputs.accuracy }}
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
-
+          python-version: '3.10'
+          cache: pip
       - name: Install dependencies
         run: pip install -r requirements.txt
-
-      - name: Authenticate to GCP (Workload Identity Federation)
+      - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-
-      - name: Pull data with DVC
+      - name: Pull versioned data with DVC
         run: dvc pull data/train_phase1.csv data/eval.csv
-
-      - name: Train model
+      - name: Train and evaluate model
+        env:
+          MLFLOW_TRACKING_URI: sqlite:///mlflow-ci.db
+          MLFLOW_EXPERIMENT_NAME: wine-quality-ci
         run: python src/train.py
-
       - name: Read metrics
         id: read_metrics
         run: |
-          ACC=$(python -c "import json; d=json.load(open('outputs/metrics.json')); print(d['accuracy'])")
-          echo "accuracy=$ACC" >> $GITHUB_OUTPUT
-
-      - name: Upload model to Cloud Storage
-        run: |
-          python - <<'EOF'
-          from google.cloud import storage
-          import os
-
-          bucket_name = '${{ secrets.CLOUD_BUCKET }}'
-          client = storage.Client()
-          bucket = client.bucket(bucket_name)
-          blob = bucket.blob('models/latest/model.pkl')
-          blob.upload_from_filename('models/model.pkl')
-          print(f"Uploaded model to gs://{bucket_name}/models/latest/model.pkl")
-          EOF
-
-      - name: Save metrics as artifact
+          ACC=$(python -c "import json; print(json.load(open('outputs/metrics.json'))['accuracy'])")
+          echo "accuracy=$ACC" >> "$GITHUB_OUTPUT"
+      - name: Upload candidate model and evaluation
         uses: actions/upload-artifact@v4
         with:
-          name: metrics
-          path: outputs/metrics.json
+          name: candidate-model
+          path: |
+            models/model.pkl
+            outputs/metrics.json
+            outputs/report.txt
+          if-no-files-found: error
 
-
-  # ---------------------------------------------------------------------------
-  # JOB 3 - EVAL
-  # Kiem tra nguong chat luong (accuracy >= 0.70).
-  # Pipeline dung lai o day neu mo hinh chua dat yeu cau.
-  # Chi chay khi Job 2 (Train) hoan thanh thanh cong.
-  # ---------------------------------------------------------------------------
   eval:
     name: Eval
     needs: train
     runs-on: ubuntu-latest
     steps:
-
-      - name: Check eval gate
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-model
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - name: Enforce quality and rollback gates
+        env:
+          CLOUD_BUCKET: ${{ secrets.CLOUD_BUCKET }}
+          NEW_ACCURACY: ${{ needs.train.outputs.accuracy }}
         run: |
           python - <<'EOF'
-          acc = float("${{ needs.train.outputs.accuracy }}")
-          if acc < 0.60:
-              raise SystemExit(f"FAILED: accuracy {acc:.4f} < 0.70. Huy deploy.")
-          print("PASSED: dang trien khai model.")
+          import json
+          import os
+          from google.cloud import storage
+
+          threshold = 0.70
+          new_accuracy = float(os.environ['NEW_ACCURACY'])
+          if new_accuracy < threshold:
+              raise SystemExit(
+                  f'FAILED: accuracy {new_accuracy:.4f} < {threshold:.2f}; deploy blocked.'
+              )
+
+          bucket = storage.Client().bucket(os.environ['CLOUD_BUCKET'])
+          previous_blob = bucket.blob('models/latest/metrics.json')
+          if previous_blob.exists():
+              previous_metrics = json.loads(previous_blob.download_as_text())
+              previous_accuracy = float(previous_metrics['accuracy'])
+              print(f'Previous production accuracy: {previous_accuracy:.4f}')
+              if new_accuracy < previous_accuracy:
+                  raise SystemExit(
+                      f'ROLLBACK GATE: {new_accuracy:.4f} < {previous_accuracy:.4f}; deploy blocked.'
+                  )
+          else:
+              print('No previous production metrics; rollback comparison skipped.')
+
+          print(f'PASSED: accuracy {new_accuracy:.4f} >= {threshold:.2f}.')
+          EOF
+      - name: Promote candidate model and metrics
+        env:
+          CLOUD_BUCKET: ${{ secrets.CLOUD_BUCKET }}
+        run: |
+          python - <<'EOF'
+          import os
+          from google.cloud import storage
+
+          bucket = storage.Client().bucket(os.environ['CLOUD_BUCKET'])
+          for source, destination in (
+              ('models/model.pkl', 'models/latest/model.pkl'),
+              ('outputs/metrics.json', 'models/latest/metrics.json'),
+              ('outputs/report.txt', 'models/latest/report.txt'),
+          ):
+              bucket.blob(destination).upload_from_filename(source)
+              print(f'Uploaded gs://{bucket.name}/{destination}')
           EOF
 
-
-  # ---------------------------------------------------------------------------
-  # JOB 4 - DEPLOY
-  # Trien khai len VM qua SSH.
-  # Chi chay khi Job 3 (Eval) hoan thanh thanh cong.
-  # ---------------------------------------------------------------------------
   deploy:
     name: Deploy
     needs: eval
     runs-on: ubuntu-latest
     steps:
-
-      - name: SSH deploy to VM
+      - uses: actions/checkout@v4
+      - name: Copy serving code and service definition
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          source: 'src/serve.py,deploy/mlops-serve.service'
+          target: '/home/${{ secrets.VM_USER }}/deploy-stage'
+          overwrite: true
+      - name: Install, restart and verify service
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
+          script_stop: true
           script: |
-            # Restart service mlops-serve tren VM
-            sudo systemctl restart mlops-serve || true
-            sleep 5
+            install -d /home/${{ secrets.VM_USER }}/src
+            install -m 0644 /home/${{ secrets.VM_USER }}/deploy-stage/src/serve.py /home/${{ secrets.VM_USER }}/src/serve.py
+            sudo install -o root -g root -m 0644 /home/${{ secrets.VM_USER }}/deploy-stage/deploy/mlops-serve.service /etc/systemd/system/mlops-serve.service
+            sudo systemctl daemon-reload
+            sudo systemctl enable mlops-serve
+            sudo systemctl restart mlops-serve
 
-            # Health check voi retry
-            for i in {1..5}; do
+            for i in 1 2 3 4 5; do
               if curl -sf http://localhost:8000/health; then
-                echo "Health check passed."
+                echo
+                echo 'Health check passed.'
                 exit 0
               fi
               echo "Retry $i/5..."
               sleep 3
             done
-            echo "Health check failed after 5 attempts."
+            sudo systemctl status mlops-serve --no-pager -l
             exit 1
