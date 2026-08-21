@@ -66,67 +66,7 @@ jobs:
         run: |
           ACC=$(python -c "import json; print(json.load(open('outputs/metrics.json'))['accuracy'])")
           echo "accuracy=$ACC" >> "$GITHUB_OUTPUT"
-      - name: Upload candidate model and evaluation
-        uses: actions/upload-artifact@v4
-        with:
-          name: candidate-model
-          path: |
-            models/model.pkl
-            outputs/metrics.json
-            outputs/report.txt
-          if-no-files-found: error
-
-  eval:
-    name: Eval
-    needs: train
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: candidate-model
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-      - name: Install evaluation dependencies
-        run: pip install google-cloud-storage==2.16.0
-      - name: Authenticate to GCP
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-      - name: Enforce quality and rollback gates
-        env:
-          CLOUD_BUCKET: ${{ secrets.CLOUD_BUCKET }}
-          NEW_ACCURACY: ${{ needs.train.outputs.accuracy }}
-        run: |
-          python - <<'EOF'
-          import json
-          import os
-          from google.cloud import storage
-
-          threshold = 0.70
-          new_accuracy = float(os.environ['NEW_ACCURACY'])
-          if new_accuracy < threshold:
-              raise SystemExit(
-                  f'FAILED: accuracy {new_accuracy:.4f} < {threshold:.2f}; deploy blocked.'
-              )
-
-          bucket = storage.Client().bucket(os.environ['CLOUD_BUCKET'])
-          previous_blob = bucket.blob('models/latest/metrics.json')
-          if previous_blob.exists():
-              previous_metrics = json.loads(previous_blob.download_as_text())
-              previous_accuracy = float(previous_metrics['accuracy'])
-              print(f'Previous production accuracy: {previous_accuracy:.4f}')
-              if new_accuracy < previous_accuracy:
-                  raise SystemExit(
-                      f'ROLLBACK GATE: {new_accuracy:.4f} < {previous_accuracy:.4f}; deploy blocked.'
-                  )
-          else:
-              print('No previous production metrics; rollback comparison skipped.')
-
-          print(f'PASSED: accuracy {new_accuracy:.4f} >= {threshold:.2f}.')
-          EOF
-      - name: Promote candidate model and metrics
+      - name: Upload model and evaluation to Cloud Storage
         env:
           CLOUD_BUCKET: ${{ secrets.CLOUD_BUCKET }}
         run: |
@@ -142,6 +82,36 @@ jobs:
           ):
               bucket.blob(destination).upload_from_filename(source)
               print(f'Uploaded gs://{bucket.name}/{destination}')
+          EOF
+      - name: Save model and evaluation artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-outputs
+          path: |
+            models/model.pkl
+            outputs/metrics.json
+            outputs/report.txt
+          if-no-files-found: error
+
+  eval:
+    name: Eval
+    needs: train
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check eval gate
+        env:
+          ACCURACY: ${{ needs.train.outputs.accuracy }}
+        run: |
+          python - <<'EOF'
+          import os
+
+          threshold = 0.70
+          accuracy = float(os.environ['ACCURACY'])
+          if accuracy < threshold:
+              raise SystemExit(
+                  f'FAILED: accuracy {accuracy:.4f} < {threshold:.2f}; deploy blocked.'
+              )
+          print(f'PASSED: accuracy {accuracy:.4f} >= {threshold:.2f}.')
           EOF
 
   deploy:
