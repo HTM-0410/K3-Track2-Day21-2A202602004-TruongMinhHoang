@@ -1,6 +1,5 @@
-# Sieu tham so cho mo hinh RandomForestClassifier
-# Thay doi cac gia tri nay giua cac lan chay de thi nghiem (Buoc 1)
-n_estimators: 100
-max_depth: 15
-min_samples_split: 3
-# Trigger pipeline
+# Best Random Forest configuration selected from the Task 1 experiments.
+model_type: random_forest
+n_estimators: 800
+max_depth: null
+min_samples_split: 2

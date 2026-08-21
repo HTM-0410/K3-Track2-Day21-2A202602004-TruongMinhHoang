@@ -6,7 +6,7 @@ import os
 
 app = FastAPI()
 
-GCS_BUCKET = os.environ.get("GCS_BUCKET", "mlops-bucket-70954c7d-4668-43bc-9e6")
+GCS_BUCKET = os.environ.get("GCS_BUCKET", "mlops-hoangtruongminh22-977661303")
 GCS_MODEL_KEY = "models/latest/model.pkl"
 MODEL_PATH = "/tmp/models/model.pkl"
 
@@ -40,6 +40,8 @@ def health():
     """
     Endpoint kiem tra suc khoe server.
     """
+    if model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
     return {"status": "ok"}
 
 
